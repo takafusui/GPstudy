@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 #
 """
-Filename: 
+Filename: neoclassical_closed2_gpytorch.py
 Author(s): Takafumi Usui
 E-mail: u.takafumi@gmail.com
 Description:
