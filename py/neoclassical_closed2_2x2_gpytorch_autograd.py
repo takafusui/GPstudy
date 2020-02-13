@@ -78,7 +78,7 @@ def c_compute_analytic(
 # Set the exogenous capital domain
 # Must include the certainty equivalent steady state
 # --------------------------------------------------------------------------- #
-kbeg, kend = 0.05, 0.2  # Capital state
+kbeg, kend = 0.5, 0.2  # Capital state
 abeg, aend = 0.8, 1.2  # AR(1) technology state
 
 # --------------------------------------------------------------------------- #
@@ -101,16 +101,19 @@ plt.close()
 # Gauss-Hermite quadrature
 # --------------------------------------------------------------------------- #
 # Nodes
-x5 = np.sqrt(2) * s * np.array(
+x5 = np.sqrt(2) * s * torch.tensor(
     [2.020182870456086, 0.9585724646138185, 0, -0.9585724646138185,
-     -2.020182870456086]) + mu
+     -2.020182870456086], dtype=torch.float64) + mu
+
 # Weights
-omega5 = np.pi**(-1/2) * np.array(
+omega5 = np.pi**(-1/2) * torch.tensor(
     [0.01995324205904591, 0.3936193231522412, 0.9453087204829419,
-     0.3936193231522412, 0.01995324205904591])
+     0.3936193231522412, 0.01995324205904591], dtype=torch.float64)
 
 print("GH5 nodes are {}".format(x5))
 print("GH5 weights are {}".format(omega5))
+
+# sys.exit(0)
 
 
 # --------------------------------------------------------------------------- #
@@ -185,12 +188,12 @@ num_test = 1000  # Number of test samples
 # Training datasets
 X_limits = np.array([[kbeg, kend], [abeg, aend]])
 X_samping = LHS(xlimits=X_limits)
-train_X = torch.tensor(X_samping(num_train))
+train_X = torch.tensor(X_samping(num_train), dtype=torch.float64)
 
 train_shape = (num_train, dim_input)
 
 # Test datasets, used to evaluate the approximation quality
-test_X = torch.tensor(X_samping(num_test))
+test_X = torch.tensor(X_samping(num_test), dtype=torch.float64)
 test_shape = (num_test, dim_input)
 
 # Shape check
@@ -233,7 +236,7 @@ with torch.no_grad(), gpytorch.settings.fast_pred_var():
     for k_idx, k in enumerate(k_mgrid[:, 0]):
         for a_idx, a in enumerate(a_mgrid[:, 1]):
             # Capital stock in the next period
-            state = torch.tensor([k, a])[None, :].double()
+            state = torch.tensor([k, a], dtype=torch.float64)[None, :]
             observed_pred = likelihood(gp_kplus(state))
             kplus_mu[k_idx, a_idx] = observed_pred.mean.numpy()
             kplus_minus2sigma[k_idx, a_idx], \
@@ -275,11 +278,9 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
     x_L = np.ones(nvar) * 0
     x_U = np.ones(nvar) * 1000
 
-    omega5 = torch.tensor(omega5)
-
     # AR(1) technology shock
     # x5 is the Gauss-Hermite nodes
-    aplus = torch.empty(x5.shape)
+    aplus = torch.empty(x5.shape, dtype=torch.float64)
     for epsilon_idx, epsilon_plus in enumerate(x5):
         aplus[epsilon_idx] = a**rho * np.exp(epsilon_plus)
 
@@ -294,7 +295,7 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
     def eval_grad_f(x):
         """ Gradient of the dummy objective function """
         assert len(x) == nvar
-        return np.zeros(nvar)
+        return np.zeros(nvar, dtype=np.float64)
 
     ncon = nvar  # Number of constraints
 
@@ -302,14 +303,16 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
     g0: Euler equation wrt. k_{t+1}
     """
 
-    g_L = np.zeros(ncon)
+    g_L = np.zeros(ncon, dtype=np.float64)
     g_U = g_L
 
     nnzj = int(nvar * ncon)  # Number of (possibly) non-zeros in Jacobian
     nnzh = int((nvar**2 - nvar) / 2 + nvar)  # Number of non-zeros in Hessian
 
-    def eval_g(x):
-        """ The system of non-linear equilibrium conditions
+    def eval_g_torch(x):
+        """
+        Represented by PyTorch
+        The system of non-linear equilibrium conditions
         x[0]: Capital stock in the next period
         """
         assert len(x) == nvar
@@ -318,17 +321,26 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
         con = a * k**alpha * ls**(1-alpha) - x[0]
 
         # Labor supply tomorrow
-        ls_plus = torch.empty(x5.shape)
+        ls_plus = torch.empty(x5.shape, dtype=torch.float64)
         for aplus_idx, aplus_val in enumerate(aplus):
             ls_plus[aplus_idx] = ls_compute(
                 k=x[0], A=aplus_val, alpha=alpha, psi=psi, theta=theta)
 
         # Capital stock tomorrow
-        k_plusplus = torch.empty(aplus.shape)
+        _k_plusplus = []
+        # k_plusplus = torch.empty(aplus.shape)
         for aplus_idx, aplus_val in enumerate(aplus):
-            state_plus = torch.tensor([x[0], aplus_val])[None, :].float()
-            observed_pred = likelihood(gp_kplus(state_plus))
-            k_plusplus[aplus_idx] = observed_pred.mean.detach()
+            if type(x) is torch.Tensor:
+                state_plus = torch.stack([x[0], aplus_val])[None, :]
+            elif type(x) is np.ndarray:
+                state_plus = torch.tensor(
+                    [x[0], aplus_val], dtype=torch.float64)[None, :]
+            else:
+                raise TypeError("x shold be either torch.Tensor or np.ndarray")
+            pred_mean = likelihood(gp_kplus(state_plus)).mean
+            _k_plusplus.append(pred_mean)
+
+        k_plusplus = torch.stack(_k_plusplus).flatten()
 
         # Consumption tomorrow
         con_plus = aplus * x[0]**alpha * ls_plus**(1-alpha) - k_plusplus
@@ -339,23 +351,11 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
         g0 = 1 / con - beta * alpha * torch.sum(omega5 * (
             1 / con_plus * aplus * x[0]**(alpha-1) * ls_plus**(1-alpha)))
 
-        return np.array([g0])
+        return [g0]
 
-    def jacobian(y, x, create_graph=False):
-        """ Compute Jacobian """
-        jac = []
-        flat_y = y.reshape(-1)
-        grad_y = torch.zeros_like(flat_y)
-        for i in range(len(flat_y)):
-            grad_y[i] = 1.
-            grad_x, = torch.autograd.grad(flat_y,
-                                          x,
-                                          grad_y,
-                                          retain_graph=True,
-                                          create_graph=create_graph)
-            jac.append(grad_x)
-            grad_y[i] = 0.
-        return torch.stack(jac).reshape(y.shape + x.shape)
+    def eval_g_numpy(x):
+        """ Convert from Tensor to numpy so that IPOPT can handle """
+        return np.array(eval_g_torch(x), dtype=np.float64)
 
     def eval_jac_g(x, flag):
         """ Numerical approximation of the Jacobian of the system of
@@ -379,10 +379,11 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
             # Automatic gradient by PyTorch
             assert len(x) == nvar
             x_tensor = torch.tensor(x, requires_grad=True)
-            _eval_jac_g = []
+            jac = []
             for i in range(ncon):
-                _eval_jac_g.append(jacobian(eval_g(x_tensor)[i], x_tensor))
-            return torch.stack(_eval_jac_g).flatten().numpy()
+                grad, = torch.autograd.grad(eval_g_torch(x_tensor)[i], x_tensor)
+                jac.append(grad)
+            return torch.stack(jac).flatten().numpy()
 
     # ----------------------------------------------------------------------- #
     # Define a NLP model
@@ -391,13 +392,13 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
 
     neoclassical = pyipopt.create(
         nvar, x_L, x_U, ncon, g_L, g_U, nnzj, nnzh, eval_f, eval_grad_f,
-        eval_g, eval_jac_g)
+        eval_g_numpy, eval_jac_g)
     neoclassical.str_option("linear_solver", "ma57")
     neoclassical.str_option("hessian_approximation", "limited-memory")
     neoclassical.str_option("derivative_test", "first-order")
     # neoclassical.num_option("tol", 1e-7)
     # neoclassical.num_option("acceptable_tol", 1e-6)
-    # neoclassical.int_option("max_iter", 50)
+    neoclassical.int_option("max_iter", 10)
     neoclassical.int_option("print_level", 5)
     xstar, zl, zu, constraint_multipliers, obj, status = neoclassical.solve(x0)
 
@@ -437,11 +438,12 @@ def time_iter_gpr(
     X_samping = LHS(xlimits=X_limits)
 
     # Training datasets
-    train_X = torch.tensor(X_samping(num_train), dtype=torch.float)
+    train_X = torch.tensor(X_samping(num_train), dtype=torch.float64)
 
     # Test datasets
-    test_X = torch.tensor(X_samping(num_test), dtype=torch.float)
-
+    test_X = torch.tensor(X_samping(num_test), dtype=torch.float64)
+    # print(test_X)
+    # sys.exit(0)
     # ----------------------------------------------------------------------- #
     # Initialize outputs
     # ----------------------------------------------------------------------- #
@@ -475,7 +477,7 @@ def time_iter_gpr(
         x0 = train_y_kplus.numpy()[:, None]
 
         # Track the optimal policies
-        train_y_kplus = np.empty(num_train)
+        train_y_kplus = np.empty(num_train, dtype=np.float64)
 
         for idx, state in enumerate(train_X.numpy()):
             # For each state, solve the system of non-linear equations
@@ -483,20 +485,20 @@ def time_iter_gpr(
                 x0[idx], state, gp_kplus, likelihood, alpha, beta, omega5)
             # Track the optimal policies
             train_y_kplus[idx] = xstar
-            print(xstar)
+            # print(type(xstar))
             sys.exit(0)
 
         # ------------------------------------------------------------------- #
         # Train the Gaussian process with the optimal policy
         # ------------------------------------------------------------------- #
         # Training data
-        train_y_kplus = torch.tensor(train_y_kplus, dtype=torch.float)
+        train_y_kplus = torch.tensor(train_y_kplus, dtype=torch.float64)
 
         # Training
         gp_kplus_updated, likelihood_updated = TrainGPModel(
             train_X, train_y_kplus, learning_rate=learning_rate,
             training_iter=training_iter, print_skip=print_skip)
-
+        # sys.exit(0)
         # ------------------------------------------------------------------- #
         # Approximation error analysis
         # Update the policy functions for the next iteration
@@ -543,7 +545,7 @@ def time_iter_gpr(
 # Compute the optimal policy functions
 # --------------------------------------------------------------------------- #
 epsilons, gp_kplus_star, likelihood = time_iter_gpr(
-    num_train=50, num_test=1000, learning_rate=0.05, training_iter=500,
+    num_train=25, num_test=1000, learning_rate=0.05, training_iter=500,
     print_skip=0)
 
 # sys.exit(0)
@@ -569,7 +571,7 @@ gridplt_analytic = np.random.uniform([kbeg, 1], [kend, 1], (50, dim_input))
 
 # Capital stock ------------------------------------------------------------- #
 with torch.no_grad(), gpytorch.settings.fast_pred_var():
-    stateplus = torch.tensor(gridplt, dtype=torch.float)
+    stateplus = torch.tensor(gridplt, dtype=torch.float64)
     observed_pred = likelihood(gp_kplus_star(stateplus))
     kplus_star = observed_pred.mean.numpy()
 
@@ -596,7 +598,7 @@ with torch.no_grad(), gpytorch.settings.fast_pred_var():
     for k_idx, k in enumerate(k_mgrid[:, 0]):
         for a_idx, a in enumerate(a_mgrid[:, 1]):
             # Capital stock in the next period
-            state = torch.tensor([k, a])[None, :].float()
+            state = torch.tensor([k, a], dtype=torch.float64)[None, :]
             observed_pred = likelihood(gp_kplus_star(state))
             kplus_mu[k_idx, a_idx] = observed_pred.mean.numpy()
             kplus_minus2sigma[k_idx, a_idx], kplus_plus2sigma[k_idx, a_idx] = \

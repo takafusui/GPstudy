@@ -58,12 +58,14 @@ def eval_jac_g(x, flag):
 # --------------------------------------------------------------------------- #
 # Some checks
 # --------------------------------------------------------------------------- #
-x = torch.tensor([1., 2., 3.], dtype=torch.float64)  # On this point
+# x = torch.tensor([1., 2., 3.], dtype=torch.float64)  # On this point
+x = np.array([1., 2., 3.], dtype=np.float64)  # On this point
 print('Function is {}'.format(np.array(eval_g(x))))
 print('Structure of Jacobian is {}'.format(eval_jac_g(x, True)))
 print('Elements of Jacobian are {}'.format(eval_jac_g(x, False)))
 
 # Gradient check
-x_tensor = x.clone().detach().requires_grad_(True)
+# x_tensor = x.clone().detach().requires_grad_(True)
+x_tensor = torch.tensor(x, dtype=torch.float64, requires_grad=True)
 chk = torch.autograd.gradcheck(eval_g, x_tensor)
 print(chk)
