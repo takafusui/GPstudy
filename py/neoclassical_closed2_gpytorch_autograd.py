@@ -11,6 +11,7 @@ Greenwood-Hercowitz-Huffman preferences
 GPyTorch: Gaussian process regression
 PyTorch: automatic gradient
 IPOPT + pyipopt: optimizer
+Output is z-scored
 """
 import sys
 import warnings
@@ -183,10 +184,41 @@ def TrainGPModel(
 
 
 # --------------------------------------------------------------------------- #
-# Train the Gaussian process
+# Z-scored and train the Gaussian process
 # --------------------------------------------------------------------------- #
+def mean_std(train_y):
+    """
+    Compute the mean and the standard deviation of the output train_y
+    train_y: Original output (torch.tensor)
+    return mean (torch.tensor) and standard deviation (torch.tensor)
+    """
+    return train_y.mean(-1, keepdim=True), train_y.std(-1, keepdim=True)
+
+
+def z_scored(train_y):
+    """
+    Standardization (z-scored)
+    train_y: Original output (torch.tensor)
+    return zscored output (torch.tensor)
+    """
+    train_y_mean, train_y_std = mean_std(train_y)
+    return (train_y - train_y_mean) / train_y_std
+
+
+def scale_back(train_y, train_y_zscored):
+    """
+    Scale back to the original output
+    train_y: Original output (torch.tensor)
+    train_y_zscored: z-scored output (torch.tensor)
+    return scaled-backed output (torch.tensor)
+    """
+    train_y_mean, train_y_std = mean_std(train_y)
+    return train_y_zscored * train_y_std + train_y_mean
+
+
+train_y_kplus_zscored = z_scored(train_y_kplus)
 gp_kplus, likelihood = TrainGPModel(
-    train_x, train_y_kplus, learning_rate=0.1, training_iter=1000,
+    train_x, train_y_kplus_zscored, learning_rate=0.1, training_iter=1000,
     print_skip=50)
 
 # sys.exit(0)
@@ -202,16 +234,20 @@ with torch.no_grad(), gpytorch.settings.fast_pred_var():
     plot_x = torch.linspace(kbeg, kend, 50, dtype=torch.float64)
     observed_pred_kplus = likelihood(gp_kplus(plot_x))
 
+# sys.exit(0)
 with torch.no_grad():
     # Initialize plot for kplus
     fig, ax = plt.subplots(1, 1, figsize=(7, 5))
 
     # Get upper and lower confidence bounds
     lower, upper = observed_pred_kplus.confidence_region()
+    lower = scale_back(train_y_kplus, lower)
+    upper = scale_back(train_y_kplus, upper)
     # Plot training data as black stars
     ax.plot(train_x.numpy(), train_y_kplus.numpy(), 'k*')
     # Plot predictive means as blue line
-    ax.plot(plot_x.numpy(), observed_pred_kplus.mean.numpy(), 'b')
+    observed_pred_kplus = scale_back(train_y_kplus, observed_pred_kplus.mean)
+    ax.plot(plot_x.numpy(), observed_pred_kplus.numpy(), 'b')
     # Shade between the lower and upper confidence bounds
     ax.fill_between(plot_x.numpy(), lower.numpy(), upper.numpy(), alpha=0.5)
     ax.set_xlim([kbeg, kend])
@@ -228,7 +264,7 @@ with torch.no_grad():
 # --------------------------------------------------------------------------- #
 # Equilibrium conditions
 # --------------------------------------------------------------------------- #
-def euler(x0, k, gp_kplus, likelihood):
+def euler(x0, k, gp_kplus, likelihood, train_y_org):
     """
     Set of a non-linear equilibrium condition solved by IPOPT + pyipopt
     Jacobian is supplied via the automatic gradient of PyTorch
@@ -236,6 +272,7 @@ def euler(x0, k, gp_kplus, likelihood):
     x0: Starting values for the optimization
     k: Current capital state
     gp_kplus, likelihood: Gaussian process regression model (GPyTorch)
+    train_y_org: Original traininig outputs
     x[0]: Capital stock in the next period
     """
 
@@ -243,7 +280,7 @@ def euler(x0, k, gp_kplus, likelihood):
 
     # All of plicies are assumed to be non-negative
     x_L = np.zeros(nvar, dtype=np.float64)
-    x_U = np.ones(nvar, dtype=np.float64) * np.inf
+    x_U = np.ones(nvar, dtype=np.float64) * 1000
 
     def eval_f(x):
         """ Dummy objective function """
@@ -297,6 +334,9 @@ def euler(x0, k, gp_kplus, likelihood):
                 [x[0]], dtype=torch.float64)[None, :])).mean
         else:
             raise TypeError("x shold be either torch.Tensor or np.ndarray")
+
+        # Scale back to the original output range
+        k_plusplus = scale_back(train_y_org, k_plusplus)
 
         # Consumption tomorrow
         con_plus = A * x[0]**alpha * ls_plus**(1-alpha) - k_plusplus
@@ -366,7 +406,7 @@ def euler(x0, k, gp_kplus, likelihood):
 
 
 # --------------------------------------------------------------------------- #
-# Time iteration collocation
+# Time iteration collocation with the Gaussian process regression
 # --------------------------------------------------------------------------- #
 def time_iter_gp(num_train, training_iter):
     """
@@ -383,12 +423,13 @@ def time_iter_gp(num_train, training_iter):
     # ----------------------------------------------------------------------- #
     train_x = torch.linspace(kbeg, kend, num_train, dtype=torch.float64)
     train_y_kplus = train_x  # Initial guess
-
+    # Z-scored
+    train_y_kplus_zscored = z_scored(train_y_kplus)
     # ----------------------------------------------------------------------- #
     # Instantiate and train the Gaussian processes
     # ----------------------------------------------------------------------- #
     gp_kplus, likelihood = TrainGPModel(
-        train_x, train_y_kplus, learning_rate=0.1, training_iter=1000,
+        train_x, train_y_kplus_zscored, learning_rate=0.1, training_iter=1000,
         print_skip=50)
 
     # sys.exit(0)
@@ -396,33 +437,36 @@ def time_iter_gp(num_train, training_iter):
     # Time iteration collocation
     # ----------------------------------------------------------------------- #
     for n in range(1, num_iter+1):
-        # Starting value retliving from the previous optimization
-        x0 = train_y_kplus.numpy()[:, None]
-
         # Get into evaluation (predictive posterior) mode
         gp_kplus.eval()
         likelihood.eval()
 
-        # Keep the optimal policies
+        # Keep the original value range
+        train_y_kplus_org = train_y_kplus
+
+        # Starting value retliving from the previous optimization
+        x0 = train_y_kplus.numpy()[:, None]
+
+        # Track the optimal policies
         train_y_kplus = np.empty_like(train_y_kplus)
 
         for idx, k in enumerate(train_x.numpy()):
             # For each state, solve the system of non-linear equations
-            xstar = euler(x0[idx], k, gp_kplus, likelihood)
+            xstar = euler(x0[idx], k, gp_kplus, likelihood, train_y_kplus_org)
             # Track the optimal policies
             train_y_kplus[idx] = xstar
-            # print(xstar)
             # sys.exit(0)
         # ------------------------------------------------------------------- #
         # Train the Gaussian process with the optimal policy
         # ------------------------------------------------------------------- #
-        # Training data
+        # Training data before taking z-score
         train_y_kplus = torch.from_numpy(train_y_kplus)
-
+        # Z-scored output
+        train_y_kplus_zscored = z_scored(train_y_kplus)
         # Training
         gp_kplus_updated, likelihood_updated = TrainGPModel(
-            train_x, train_y_kplus, learning_rate=0.1, training_iter=1000,
-            print_skip=0)
+            train_x, train_y_kplus_zscored, learning_rate=0.1,
+            training_iter=1000, print_skip=0)
 
         # ------------------------------------------------------------------- #
         # Approximation error analysis
@@ -451,6 +495,7 @@ def time_iter_gp(num_train, training_iter):
             # Terminate the time iteration and save the optimal surrogates
             gp_kplus_star = gp_kplus_updated
             likelihood_star = likelihood_updated
+            train_y_kplus_org = train_y_kplus_org
             print("Time iteration collocation is terminated successfuly with "
                   "{} iterations".format(n))
             break  # Terminate the iteration
@@ -462,13 +507,14 @@ def time_iter_gp(num_train, training_iter):
 
         # sys.exit(0)
 
-    return epsilons, gp_kplus_star, likelihood_star
+    return epsilons, gp_kplus_star, likelihood_star, train_y_kplus_org
 
 
 # --------------------------------------------------------------------------- #
 # num_train = 30, training_iter = 250
 # --------------------------------------------------------------------------- #
-epsilons, gp_kplus_star, likelihood_star = time_iter_gp(25, 250)
+epsilons, gp_kplus_star, likelihood_star, train_y_kplus_org \
+    = time_iter_gp(25, 250)
 
 # sys.exit(0)
 
@@ -492,8 +538,11 @@ likelihood_star.eval()
 with torch.no_grad(), gpytorch.settings.fast_pred_var():
     plot_x = torch.linspace(kbeg, kend, 50, dtype=torch.float64)
     pred = likelihood_star(gp_kplus_star(plot_x))
-    kplus_star_mu = pred.mean.numpy()
-    kplus_lower, kplus_upper = pred.confidence_region()
+    kplus_star_mu = pred.mean  # Z-scored value
+    kplus_star_mu = scale_back(train_y_kplus_org, kplus_star_mu)
+    kplus_lower, kplus_upper = pred.confidence_region()  # Z-scored value
+    kplus_lower = scale_back(train_y_kplus_org, kplus_lower)
+    kplus_upper = scale_back(train_y_kplus_org, kplus_upper)
 
 with torch.no_grad():
     # Initialize plot

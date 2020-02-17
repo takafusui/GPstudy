@@ -12,13 +12,14 @@ AR(1) TFP shock
 GPyTorch: Gaussian process regression
 PyTorch: automatic gradient
 IPOPT + pyipopt: optimizer
+Output is standardized (Z-score)
 """
 import sys
 import warnings
 import numpy as np
-import torch
-import gpytorch
-import pyipopt
+import torch  # automatic gradient
+import gpytorch  # Gaussian process regeression
+import pyipopt  # IPOPT optimization
 from smt.sampling_methods import LHS  # Latin Hypercube sampling
 # plot
 import matplotlib.pyplot as plt
@@ -99,8 +100,10 @@ ax.set_ylim(0, None)
 plt.savefig('../figs/GHH_kplus_1D.pdf')
 plt.close()
 
+# sys.exit(0)
 # --------------------------------------------------------------------------- #
 # Gauss-Hermite quadrature
+# torch.tensor version
 # --------------------------------------------------------------------------- #
 # Nodes
 x5 = np.sqrt(2) * s * torch.tensor(
@@ -125,6 +128,8 @@ def TrainGPModel(
         train_X, train_y_kplus, learning_rate, training_iter, print_skip):
     """
     Train the Gaussian process and optimize the model hyperparameters
+    RBF kernel
+    Adam optimizer
     train_X.shape == [n, d]
     train_y_kplus.shape == [n]
     """
@@ -159,6 +164,7 @@ def TrainGPModel(
     # Loss for GP - the marginal log likelihood
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, gp_kplus)
 
+    # Hyperparameter optimization
     for i in range(training_iter):
         # Zero gradients from previous iteration
         optimizer.zero_grad()
@@ -204,23 +210,50 @@ assert test_X.shape == test_shape, 'Shape is not {}'.format(test_shape)
 
 train_y_kplus = train_X[:, 0]
 
-# --------------------------------------------------------------------------- #
-# zscored
-# --------------------------------------------------------------------------- #
-# # Mean
-# train_y_kplus_mean = train_y_kplus.mean(-1, keepdim=True)
-# # Stadard deviation_
-# train_y_kplus_std = train_y_kplus.std(-1, keepdim=True)
-# # z-scored input data
-# train_y_kplus_zscored = (train_y_kplus - train_y_kplus_mean) / \
-#     train_y_kplus_std
 
 # --------------------------------------------------------------------------- #
-# Train the Gaussian process
+# Z-scored and train the Gaussian process
 # --------------------------------------------------------------------------- #
+def mean_std(train_y):
+    """
+    Compute the mean and the standard deviation of the output train_y
+    train_y: Original output (torch.tensor)
+    return mean (torch.tensor) and standard deviation (torch.tensor)
+    """
+    return train_y.mean(-1, keepdim=True), train_y.std(-1, keepdim=True)
+
+
+def z_score(train_y):
+    """
+    Standardization (z-score)
+    train_y: Original output (torch.tensor)
+    return standardized output (torch.tensor)
+    """
+    train_y_mean, train_y_std = mean_std(train_y)
+    return (train_y - train_y_mean) / train_y_std
+
+
+def scale_back(train_y, train_y_zscore):
+    """
+    Scale back to the original output range
+    train_y: Original output (torch.tensor)
+    train_y_zscore: Standardized output (torch.tensor)
+    return scaled-backed output (torch.tensor)
+    """
+    train_y_mean, train_y_std = mean_std(train_y)
+    return train_y_zscore * train_y_std + train_y_mean
+
+
+# sys.exit(0)
+# --------------------------------------------------------------------------- #
+# Train the Gaussian process
+# Note that the output is standardized
+# --------------------------------------------------------------------------- #
+# Z-score output
+train_y_kplus_zscore = z_score(train_y_kplus)
 gp_kplus, likelihood = TrainGPModel(
-    train_X, train_y_kplus, learning_rate=0.1, training_iter=1000,
-    print_skip=50)
+    train_X, train_y_kplus_zscore, learning_rate=0.1, training_iter=1000,
+    print_skip=100)
 
 # Get into evaluation (predictive posterior) mode
 gp_kplus.eval()
@@ -229,9 +262,9 @@ likelihood.eval()
 cartesian_size = 7j
 k_mgrid, a_mgrid = np.mgrid[
     kbeg:kend:cartesian_size, abeg:aend:cartesian_size]
-kplus_mu = np.empty_like(k_mgrid)
-kplus_minus2sigma = np.empty_like(k_mgrid)
-kplus_plus2sigma = np.empty_like(k_mgrid)
+kplus_mu = torch.empty(k_mgrid.shape)
+kplus_minus2sigma = torch.empty(k_mgrid.shape)
+kplus_plus2sigma = torch.empty(k_mgrid.shape)
 
 # Make predictions by feeding model through likelihood
 with torch.no_grad(), gpytorch.settings.fast_pred_var():
@@ -239,11 +272,15 @@ with torch.no_grad(), gpytorch.settings.fast_pred_var():
         for a_idx, a in enumerate(a_mgrid[:, 1]):
             # Capital stock in the next period
             state = torch.tensor([k, a], dtype=torch.float64)[None, :]
-            observed_pred = likelihood(gp_kplus(state))
-            kplus_mu[k_idx, a_idx] = observed_pred.mean.numpy()
-            kplus_minus2sigma[k_idx, a_idx], \
-                kplus_plus2sigma[
-                    k_idx, a_idx] = observed_pred.confidence_region()
+            pred = likelihood(gp_kplus(state))
+            kplus_mu[k_idx, a_idx] = pred.mean
+            kplus_minus2sigma[k_idx, a_idx], kplus_plus2sigma[k_idx, a_idx] = \
+                pred.confidence_region()
+
+    # Scale back to the original range
+    kplus_mu = scale_back(train_y_kplus, kplus_mu)
+    kplus_minus2sigma = scale_back(train_y_kplus, kplus_minus2sigma)
+    kplus_plus2sigma = scale_back(train_y_kplus, kplus_plus2sigma)
 
 # Initialize plot
 fig, ax = plt.subplots(1, 1, figsize=(10, 7), subplot_kw={'projection': '3d'})
@@ -254,6 +291,9 @@ ax.scatter(k_mgrid, a_mgrid, kplus_minus2sigma, c='gold', marker='v',
            label=r'$\mu-2\sigma$')
 ax.legend(loc='best')
 ax.invert_xaxis()
+ax.set_xlabel(r"$K_t$")
+ax.set_ylabel(r"$A_t$")
+ax.set_zlabel(r"$K_{t+1}$")
 plt.savefig('../figs/GHH_initial_guess.pdf')
 plt.close()
 
@@ -263,7 +303,8 @@ plt.close()
 # --------------------------------------------------------------------------- #
 # Equilibrium conditions
 # --------------------------------------------------------------------------- #
-def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
+def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5,
+          train_y_kplus_org):
     """
     Set of a non-linear equilibrium condition to be solved by IPOPT
     Jacobian is supplied via the automatic gradient of PyTorch
@@ -272,6 +313,7 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
     state: Current state, state[0]: capital state and state[1]: AR(1) TFP shock
     gp_kplus, likelihood: Gaussian process regression model for the capital
     stock in the next period
+    train_y_kplus_org is used to scale back to the original range
     x[0]: Capital stock in the next period
     """
     nvar = 1  # Number of variables
@@ -279,14 +321,14 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
     k, a = state[0], state[1]  # Extract the current state
 
     # All of plicies are assumed to be non-negative
-    x_L = np.ones(nvar) * 0
-    x_U = np.ones(nvar) * 1000
+    x_L = np.zeros(nvar, dtype=np.float64)
+    x_U = np.ones(nvar, dtype=np.float64) * 100
 
     # AR(1) technology shock
     # x5 is the Gauss-Hermite nodes
     aplus = torch.empty(x5.shape, dtype=torch.float64)
     for epsilon_idx, epsilon_plus in enumerate(x5):
-        aplus[epsilon_idx] = a**rho * np.exp(epsilon_plus)
+        aplus[epsilon_idx] = a**rho * torch.exp(epsilon_plus)
 
     # Current labor supply
     ls = ls_compute(k=k, A=a, alpha=alpha, psi=psi, theta=theta)
@@ -333,7 +375,7 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
         # Capital stock tomorrow
         _k_plusplus = []
         for aplus_idx, aplus_val in enumerate(aplus):
-            if type(x) is torch.Tensor:  # x is defined as torch.tensor
+            if type(x) is torch.Tensor:  # x is defined as torch.Tensor
                 state_plus = torch.stack([x[0], aplus_val])[None, :]
             elif type(x) is np.ndarray:  # x is defined as numpy.ndarray
                 state_plus = torch.tensor(
@@ -342,8 +384,10 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
                 raise TypeError("x shold be either torch.Tensor or np.ndarray")
             pred_mean = likelihood(gp_kplus(state_plus)).mean  # Mean
             _k_plusplus.append(pred_mean)
-
+        # Z-score policy
         k_plusplus = torch.cat(_k_plusplus, dim=0)
+        # Scale back to the original output range
+        k_plusplus = scale_back(train_y_kplus_org, k_plusplus)
 
         # Consumption tomorrow
         con_plus = aplus * x[0]**alpha * ls_plus**(1-alpha) - k_plusplus
@@ -369,7 +413,9 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
         row_idx = np.empty(nnzj, dtype=int)  # Row index
         col_idx = np.empty(nnzj, dtype=int)  # Column index
 
+        # ------------------------------------------------------------------- #
         # Jacobian matrix structure
+        # ------------------------------------------------------------------- #
         if flag:
             for i in range(ncon):
                 for j in range(nvar):
@@ -400,9 +446,9 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
         eval_g_numpy, eval_jac_g)
     neoclassical.str_option("linear_solver", "ma57")
     neoclassical.str_option("hessian_approximation", "limited-memory")
-    # neoclassical.str_option("derivative_test", "first-order")
-    neoclassical.int_option("max_iter", 10)
+    # neoclassical.str_option("derivative_test", "first-order")  # Pass!
     neoclassical.int_option("print_level", 1)
+    neoclassical.int_option("max_iter", 100)
     xstar, zl, zu, constraint_multipliers, obj, status = neoclassical.solve(x0)
 
     if status not in [0, 1]:
@@ -414,7 +460,7 @@ def euler(x0, state, gp_kplus, likelihood, alpha, beta, omega5):
 
 
 # --------------------------------------------------------------------------- #
-# Time iteration collocation
+# Time iteration collocation with the Gaussian process regression
 # --------------------------------------------------------------------------- #
 def time_iter_gpr(
         num_train, num_test, learning_rate, training_iter, print_skip):
@@ -447,9 +493,10 @@ def time_iter_gpr(
 
     # sys.exit(0)
     # ----------------------------------------------------------------------- #
-    # Initialize outputs
+    # Initialize and standardize the output
     # ----------------------------------------------------------------------- #
     train_y_kplus = train_X[:, 0]
+    train_y_kplus_zscore = z_score(train_y_kplus)
 
     # Shape checks
     assert train_X.shape == (num_train, 2), 'Shape is not (num_train, 2)'
@@ -462,7 +509,7 @@ def time_iter_gpr(
     # Instantiate and train the Gaussian processes
     # ----------------------------------------------------------------------- #
     gp_kplus, likelihood = TrainGPModel(
-        train_X, train_y_kplus, learning_rate=learning_rate,
+        train_X, train_y_kplus_zscore, learning_rate=learning_rate,
         training_iter=training_iter, print_skip=print_skip)
 
     # sys.exit(0)
@@ -478,26 +525,32 @@ def time_iter_gpr(
         # Starting value retliving from the previous optimization
         x0 = train_y_kplus.numpy()[:, None]
 
+        # Keep the original value range for scaling back
+        train_y_kplus_org = train_y_kplus
+
         # Track the optimal policies
         train_y_kplus = np.empty(num_train, dtype=np.float64)
 
         for idx, state in enumerate(train_X.numpy()):
             # For each state, solve the system of non-linear equations
-            xstar = euler(
-                x0[idx], state, gp_kplus, likelihood, alpha, beta, omega5)
+            xstar = euler(x0[idx], state, gp_kplus, likelihood, alpha, beta,
+                          omega5, train_y_kplus_org)
             # sys.exit(0)
             # Track the optimal policies
             train_y_kplus[idx] = xstar
 
         # ------------------------------------------------------------------- #
         # Train the Gaussian process with the optimal policy
+        # At first, need to standardize the outputs
         # ------------------------------------------------------------------- #
-        # Training data
+        # Training data, convert from numpy
         train_y_kplus = torch.tensor(train_y_kplus, dtype=torch.float64)
+        # Z-scored output
+        train_y_kplus_zscore = z_score(train_y_kplus)
 
         # Training
         gp_kplus_updated, likelihood_updated = TrainGPModel(
-            train_X, train_y_kplus, learning_rate=learning_rate,
+            train_X, train_y_kplus_zscore, learning_rate=learning_rate,
             training_iter=training_iter, print_skip=print_skip)
         # sys.exit(0)
 
@@ -516,8 +569,8 @@ def time_iter_gpr(
             pred_kplus = likelihood(gp_kplus(test_X))
             pred_update_kplus = likelihood_updated(gp_kplus_updated(test_X))
 
-            epsilon = np.max(np.abs(
-                pred_kplus.mean.numpy() - pred_update_kplus.mean.numpy()))
+            epsilon = torch.max(torch.abs(
+                pred_kplus.mean - pred_update_kplus.mean)).numpy()
         epsilons.append(epsilon)  # Track the history of epsilon
 
         if n % 1 == 0:
@@ -528,6 +581,7 @@ def time_iter_gpr(
             # Terminate the time iteration and save the optimal surrogates
             gp_kplus_star = gp_kplus_updated
             likelihood_star = likelihood_updated
+            train_y_kplus_last = train_y_kplus_org
             print("Time iteration collocation is terminated successfuly with "
                   "{} iterations".format(n))
             break  # Terminate the iteration
@@ -537,14 +591,14 @@ def time_iter_gpr(
             gp_kplus = gp_kplus_updated
             likelihood = likelihood_updated
 
-    return epsilons, gp_kplus_star, likelihood_star
+    return epsilons, gp_kplus_star, likelihood_star, train_y_kplus_last
 
 
 # --------------------------------------------------------------------------- #
 # Compute the optimal policy functions
 # --------------------------------------------------------------------------- #
-epsilons, gp_kplus_star, likelihood_star = time_iter_gpr(
-    num_train=25, num_test=1000, learning_rate=0.05, training_iter=500,
+epsilons, gp_kplus_star, likelihood_star, train_y_kplus_last = time_iter_gpr(
+    num_train=10, num_test=1000, learning_rate=0.05, training_iter=500,
     print_skip=0)
 
 # sys.exit(0)
@@ -563,7 +617,35 @@ plt.close()
 # --------------------------------------------------------------------------- #
 # Plot approximated policy functions
 # --------------------------------------------------------------------------- #
-gridplt = X_samping(250)
+# Make predictions by feeding model through likelihood
+with torch.no_grad(), gpytorch.settings.fast_pred_var():
+    for k_idx, k in enumerate(k_mgrid[:, 0]):
+        for a_idx, a in enumerate(a_mgrid[:, 1]):
+            # Capital stock in the next period
+            state = torch.tensor([k, a], dtype=torch.float64)[None, :]
+            pred = likelihood_star(gp_kplus_star(state))
+            kplus_mu[k_idx, a_idx] = pred.mean
+            kplus_minus2sigma[k_idx, a_idx], kplus_plus2sigma[k_idx, a_idx] = \
+                pred.confidence_region()
+    # Scale back to the original value range
+    kplus_mu = scale_back(train_y_kplus_last, kplus_mu)
+    kplus_minus2sigma = scale_back(train_y_kplus_last, kplus_minus2sigma)
+    kplus_plus2sigma = scale_back(train_y_kplus_last, kplus_plus2sigma)
+
+# Initialize plot
+fig, ax = plt.subplots(1, 1, figsize=(10, 7), subplot_kw={'projection': '3d'})
+ax.scatter(k_mgrid, a_mgrid, kplus_mu, c='blue', label=r'$\mu$')
+ax.scatter(k_mgrid, a_mgrid, kplus_plus2sigma, c='orangered', marker='^',
+           label=r'$\mu+2\sigma$')
+ax.scatter(k_mgrid, a_mgrid, kplus_minus2sigma, c='gold', marker='v',
+           label=r'$\mu-2\sigma$')
+ax.legend(loc='best')
+ax.invert_xaxis()
+ax.set_xlabel(r"$K_t$")
+ax.set_ylabel(r"$A_t$")
+ax.set_zlabel(r"$K_{t+1}$")
+plt.savefig('../figs/GHH_2x2_kplus_gpytorch_grid.pdf')
+plt.close()
 
 # Analytical solution when A = 1
 gridplt_analytic = np.random.uniform([kbeg, 1], [kend, 1], (50, dim_input))
@@ -571,14 +653,15 @@ gridplt_analytic = np.random.uniform([kbeg, 1], [kend, 1], (50, dim_input))
 # Capital stock ------------------------------------------------------------- #
 with torch.no_grad(), gpytorch.settings.fast_pred_var():
     stateplus = torch.tensor(gridplt, dtype=torch.float64)
-    observed_pred = likelihood_star(gp_kplus_star(stateplus))
-    kplus_star = observed_pred.mean.numpy()
+    pred = likelihood_star(gp_kplus_star(stateplus))
+    kplus_star = pred.mean  # Z-score value
+    kplus_star = scale_back(train_y_kplus_last, kplus_star)  # Scale backed
 
 kplus_analytic = kplus_compute_analytic(gridplt_analytic[:, 0])
 
 fig, ax = plt.subplots(figsize=(10, 7), subplot_kw={'projection': '3d'})
 ax.scatter(
-    gridplt[:, 0], gridplt[:, 1], kplus_star.ravel(), 'o', label='GP')
+    gridplt[:, 0], gridplt[:, 1], kplus_star.numpy().ravel(), 'o', label='GP')
 ax.scatter(
     gridplt_analytic[:, 0], gridplt_analytic[:, 1], kplus_analytic, 'o',
     label='Analytic ($A_{t}=1$)')
@@ -591,35 +674,13 @@ ax.legend(loc='best')
 plt.savefig('../figs/GHH_2x2_kplus_gpytorch.pdf')
 plt.close()
 
-# Make predictions by feeding model through likelihood
-with torch.no_grad(), gpytorch.settings.fast_pred_var():
-    for k_idx, k in enumerate(k_mgrid[:, 0]):
-        for a_idx, a in enumerate(a_mgrid[:, 1]):
-            # Capital stock in the next period
-            state = torch.tensor([k, a], dtype=torch.float64)[None, :]
-            pred = likelihood_star(gp_kplus_star(state))
-            kplus_mu[k_idx, a_idx] = pred.mean.numpy()
-            kplus_minus2sigma[k_idx, a_idx], kplus_plus2sigma[k_idx, a_idx] = \
-                pred.confidence_region()
-
-# Initialize plot
-fig, ax = plt.subplots(1, 1, figsize=(10, 7), subplot_kw={'projection': '3d'})
-ax.scatter(k_mgrid, a_mgrid, kplus_mu, c='blue', label=r'$\mu$')
-ax.scatter(k_mgrid, a_mgrid, kplus_plus2sigma, c='orangered', marker='^',
-           label=r'$\mu+2\sigma$')
-ax.scatter(k_mgrid, a_mgrid, kplus_minus2sigma, c='gold', marker='v',
-           label=r'$\mu-2\sigma$')
-ax.legend(loc='best')
-ax.invert_xaxis()
-plt.savefig('../figs/GHH_2x2_kplus_gpytorch_grid.pdf')
-plt.close()
-
 # Labor supply -------------------------------------------------------------- #
 ls_star = ls_compute(
     gridplt[:, 0], gridplt[:, 1], alpha=alpha, psi=psi, theta=theta)
 
 # Consumption --------------------------------------------------------------- #
-c_star = gridplt[:, 1] * gridplt[:, 0]**alpha * ls_star**(1-alpha) - kplus_star
+c_star = gridplt[:, 1] * gridplt[:, 0]**alpha * ls_star**(1-alpha) \
+    - kplus_star.numpy()
 
 c_star_analytic = c_compute_analytic(
     gridplt_analytic[:, 0], A=gridplt_analytic[:, 1], alpha=alpha, beta=beta,
